@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import os
+import subprocess
+import sys
 import zipfile
 
 COMPETITION = "severstal-steel-defect-detection"
@@ -9,7 +11,6 @@ EXPECTED_FILES = ["train.csv", "train_images", "test_images", "sample_submission
 
 
 def _check_credentials() -> None:
-    """Fail fast with a clear message if Kaggle credentials are missing."""
     kaggle_json = os.path.expanduser("~/.kaggle/kaggle.json")
     has_file = os.path.exists(kaggle_json)
     has_env = os.environ.get("KAGGLE_USERNAME") and os.environ.get("KAGGLE_KEY")
@@ -35,13 +36,6 @@ def _extract(zip_path: str, dest: str) -> None:
 def download(args: argparse.Namespace) -> None:
     _check_credentials()
 
-    # Import here so missing credentials produce the clear message above first.
-    import kaggle  # noqa: F401 — triggers auth
-    from kaggle.api.kaggle_api_extended import KaggleApiExtended
-
-    api = KaggleApiExtended()
-    api.authenticate()
-
     data_dir = args.data_dir
     os.makedirs(data_dir, exist_ok=True)
 
@@ -51,19 +45,20 @@ def download(args: argparse.Namespace) -> None:
         print("Pass --force to re-download.")
         return
 
-    print(f"Downloading competition data for '{COMPETITION}' into '{data_dir}' …")
-    api.competition_download_files(COMPETITION, path=data_dir, quiet=False)
+    # Use the kaggle CLI — stable across all package versions
+    kaggle_bin = os.path.join(os.path.dirname(sys.executable), "kaggle")
+    cmd = [
+        kaggle_bin, "competitions", "download",
+        "-c", COMPETITION,
+        "-p", data_dir,
+    ]
+    print(f"Downloading '{COMPETITION}' into '{data_dir}' …")
+    subprocess.run(cmd, check=True)
 
-    # The API downloads a single zip; extract it.
-    zip_name = f"{COMPETITION}.zip"
-    zip_path = os.path.join(data_dir, zip_name)
-    if os.path.exists(zip_path):
-        _extract(zip_path, data_dir)
-    else:
-        # Sometimes files are downloaded individually as separate zips.
-        for fname in os.listdir(data_dir):
-            if fname.endswith(".zip"):
-                _extract(os.path.join(data_dir, fname), data_dir)
+    # Extract any zips that were downloaded
+    for fname in sorted(os.listdir(data_dir)):
+        if fname.endswith(".zip"):
+            _extract(os.path.join(data_dir, fname), data_dir)
 
     print("Download complete. Contents:")
     for item in sorted(os.listdir(data_dir)):
