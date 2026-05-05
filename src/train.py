@@ -121,7 +121,7 @@ def train(args: argparse.Namespace) -> None:
     )
     scheduler = _build_scheduler(optimizer, cfg)
     criterion = DiceBCELoss()
-    scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
 
     best_dice = 0.0
 
