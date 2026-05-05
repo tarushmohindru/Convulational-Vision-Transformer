@@ -100,6 +100,10 @@ class SteelConfig:
     weight_decay: float = 1e-4
     val_split: float = 0.1
     grad_clip: float = 1.0
+    warmup_epochs: int = 0
+    adam_betas: tuple[float, float] = (0.9, 0.999)
+    amp_dtype: str = "float16"   # "bfloat16" or "float16"
+    compile_model: bool = False
 
     # ViT
     embed_dim: int = 512
@@ -112,6 +116,31 @@ class SteelConfig:
     # Inference
     threshold: float = 0.5
     min_mask_area: int = 200
+
+    @classmethod
+    def h200(cls) -> "SteelConfig":
+        """H200-optimised preset: ViT-L, 256×1024 input (1024 patches), bf16, compile."""
+        return cls(
+            # 256×1024 → 16×64 = 1024 patches (4× more signal than default 512-wide)
+            image_width=1024,
+            # ViT-L scale (~307 M params)
+            embed_dim=1024,
+            depth=24,
+            num_heads=16,
+            dropout=0.1,
+            attention_dropout=0.0,
+            # Training recipe
+            batch_size=16,
+            num_epochs=50,
+            learning_rate=2e-4,        # linear-scaled vs reference (batch 8 → 16, 1e-4 → 2e-4)
+            adam_betas=(0.9, 0.95),    # recommended for large ViT
+            warmup_epochs=5,
+            weight_decay=0.05,         # stronger regularisation for large model
+            # Hardware
+            amp_dtype="bfloat16",
+            compile_model=True,
+            num_workers=8,
+        )
 
     def vit_config(self) -> VisionTransformerConfig:
         return VisionTransformerConfig(

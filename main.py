@@ -17,9 +17,13 @@ def main() -> None:
     # ------------------------------------------------------------------ train
     tp = sub.add_parser("train", help="Train the ViT segmenter")
     tp.add_argument("--data-dir", default="data", help="Root data directory")
+    tp.add_argument("--preset", choices=["default", "h200"], default="default",
+                    help="Hyperparameter preset (h200: ViT-L, 1024-wide, bf16, compiled)")
     tp.add_argument("--epochs", type=int, default=30)
     tp.add_argument("--batch-size", type=int, default=8)
     tp.add_argument("--lr", type=float, default=1e-4)
+    tp.add_argument("--compile", action="store_true", help="torch.compile the model (faster on H100/H200)")
+    tp.add_argument("--bfloat16", action="store_true", help="Use bfloat16 AMP instead of float16")
     tp.add_argument("--resume", default=None, help="Path to checkpoint to resume from")
 
     # ------------------------------------------------------------------ infer

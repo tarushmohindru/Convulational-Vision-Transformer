@@ -5,8 +5,7 @@ import os
 import sys
 
 import torch
-from torch.cuda.amp import GradScaler
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -28,19 +27,50 @@ def _make_loader(dataset, batch_size: int, num_workers: int, shuffle: bool) -> D
     )
 
 
-def train(args: argparse.Namespace) -> None:
-    cfg = SteelConfig(
-        data_dir=args.data_dir,
-        train_csv=os.path.join(args.data_dir, "train.csv"),
-        image_dir=os.path.join(args.data_dir, "train_images"),
-        num_epochs=args.epochs,
-        batch_size=args.batch_size,
-        learning_rate=args.lr,
+def _build_scheduler(optimizer, cfg: SteelConfig):
+    """Linear warmup then cosine annealing."""
+    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=max(cfg.num_epochs - cfg.warmup_epochs, 1),
+        eta_min=cfg.learning_rate / 100,
     )
-    os.makedirs(cfg.checkpoint_dir, exist_ok=True)
+    if cfg.warmup_epochs == 0:
+        return cosine
+    warmup = torch.optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=0.01, end_factor=1.0, total_iters=cfg.warmup_epochs
+    )
+    return torch.optim.lr_scheduler.SequentialLR(
+        optimizer, schedulers=[warmup, cosine], milestones=[cfg.warmup_epochs]
+    )
 
+
+def train(args: argparse.Namespace) -> None:
+    data_dir = args.data_dir
+
+    if getattr(args, "preset", "default") == "h200":
+        cfg = SteelConfig.h200()
+    else:
+        cfg = SteelConfig(
+            num_epochs=args.epochs,
+            batch_size=args.batch_size,
+            learning_rate=args.lr,
+            compile_model=getattr(args, "compile", False),
+            amp_dtype="bfloat16" if getattr(args, "bfloat16", False) else "float16",
+        )
+
+    # Paths always follow CLI --data-dir
+    cfg.data_dir = data_dir
+    cfg.train_csv = os.path.join(data_dir, "train.csv")
+    cfg.image_dir = os.path.join(data_dir, "train_images")
+
+    os.makedirs(cfg.checkpoint_dir, exist_ok=True)
+    amp_dtype = torch.bfloat16 if cfg.amp_dtype == "bfloat16" else torch.float16
+    use_scaler = amp_dtype == torch.float16  # bfloat16 doesn't need a GradScaler
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+
+    print(f"device={device}  amp={cfg.amp_dtype}  compile={cfg.compile_model}")
+    print(f"image={cfg.image_height}×{cfg.image_width}  "
+          f"embed_dim={cfg.embed_dim}  depth={cfg.depth}  batch={cfg.batch_size}")
 
     # ------------------------------------------------------------------
     # Data
@@ -49,8 +79,8 @@ def train(args: argparse.Namespace) -> None:
     pivot = build_pivot(df)
 
     n_val = max(1, int(len(pivot) * cfg.val_split))
-    n_train = len(pivot) - n_val
-    train_pivot, val_pivot = pivot.iloc[:n_train], pivot.iloc[n_train:]
+    train_pivot = pivot.iloc[: len(pivot) - n_val]
+    val_pivot = pivot.iloc[len(pivot) - n_val :]
 
     train_tf = get_transforms(cfg.image_height, cfg.image_width, phase="train")
     val_tf = get_transforms(cfg.image_height, cfg.image_width, phase="val")
@@ -60,8 +90,7 @@ def train(args: argparse.Namespace) -> None:
 
     train_loader = _make_loader(train_ds, cfg.batch_size, cfg.num_workers, shuffle=True)
     val_loader = _make_loader(val_ds, cfg.batch_size, cfg.num_workers, shuffle=False)
-
-    print(f"Train: {len(train_ds)} images  |  Val: {len(val_ds)} images")
+    print(f"train={len(train_ds)}  val={len(val_ds)}")
 
     # ------------------------------------------------------------------
     # Model
@@ -69,22 +98,30 @@ def train(args: argparse.Namespace) -> None:
     vit_cfg = cfg.vit_config()
     model = ViTSegmenter(vit_cfg, num_seg_classes=4).to(device)
 
-    if args.resume:
+    if getattr(args, "resume", None):
         ckpt = torch.load(args.resume, map_location=device)
         model.load_state_dict(ckpt["model"])
         print(f"Resumed from {args.resume}")
+
+    if cfg.compile_model:
+        print("Compiling model with torch.compile (max-autotune) …")
+        model = torch.compile(model, mode="max-autotune")
+
+    n_params = sum(p.numel() for p in model.parameters()) / 1e6
+    print(f"Parameters: {n_params:.1f}M")
 
     # ------------------------------------------------------------------
     # Optimiser, scheduler, loss
     # ------------------------------------------------------------------
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay
+        model.parameters(),
+        lr=cfg.learning_rate,
+        weight_decay=cfg.weight_decay,
+        betas=cfg.adam_betas,
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=cfg.num_epochs, eta_min=cfg.learning_rate / 100
-    )
+    scheduler = _build_scheduler(optimizer, cfg)
     criterion = DiceBCELoss()
-    scaler = GradScaler()
+    scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
 
     best_dice = 0.0
 
@@ -97,15 +134,20 @@ def train(args: argparse.Namespace) -> None:
             images, masks = images.to(device), masks.to(device)
             optimizer.zero_grad(set_to_none=True)
 
-            with torch.amp.autocast(device_type="cuda"):
+            with torch.amp.autocast(device_type="cuda", dtype=amp_dtype):
                 logits = model(images)
                 loss = criterion(logits, masks)
 
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
+            if use_scaler:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+                optimizer.step()
 
             train_loss += loss.item()
             pbar.set_postfix(loss=f"{loss.item():.4f}")
@@ -115,11 +157,11 @@ def train(args: argparse.Namespace) -> None:
 
         # ---- validate ----
         model.eval()
-        val_loss, val_dice = 0.0, 0.0
+        val_loss = val_dice = 0.0
         with torch.no_grad():
             for images, masks in tqdm(val_loader, desc=f"Epoch {epoch}/{cfg.num_epochs} [val]", leave=False):
                 images, masks = images.to(device), masks.to(device)
-                with torch.amp.autocast(device_type="cuda"):
+                with torch.amp.autocast(device_type="cuda", dtype=amp_dtype):
                     logits = model(images)
                     loss = criterion(logits, masks)
                 val_loss += loss.item()
@@ -127,9 +169,11 @@ def train(args: argparse.Namespace) -> None:
 
         val_loss /= len(val_loader)
         val_dice /= len(val_loader)
+        lr_now = optimizer.param_groups[0]["lr"]
 
         print(
             f"Epoch {epoch:3d}/{cfg.num_epochs} | "
+            f"lr={lr_now:.2e} | "
             f"train_loss={train_loss:.4f} | "
             f"val_loss={val_loss:.4f} | "
             f"val_dice={val_dice:.4f}"
