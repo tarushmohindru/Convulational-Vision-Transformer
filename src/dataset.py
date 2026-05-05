@@ -45,8 +45,8 @@ def encode_rle(mask: np.ndarray) -> str:
 
 def load_train_df(csv_path: str) -> pd.DataFrame:
     df = pd.read_csv(csv_path)
-    df["ImageId"] = df["ImageId_ClassId"].str.split("_").str[0]
-    df["ClassId"] = df["ImageId_ClassId"].str.split("_").str[1].astype(int)
+    # CSV has pre-split ImageId and ClassId columns
+    df["ClassId"] = df["ClassId"].astype(int)
     return df
 
 
